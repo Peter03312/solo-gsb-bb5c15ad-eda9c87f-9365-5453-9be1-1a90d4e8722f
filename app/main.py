@@ -6,13 +6,17 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import __version__
 from .config import get_settings
 from .engine import (
+    ReleaseRequirement,
     compare_sensor,
     evaluate_batch,
+    evaluate_device_release,
     evaluate_quality_gate,
     evaluate_sample,
     find_sensor_events,
@@ -27,6 +31,8 @@ from .models import (
     PreviewResponse,
     QualityGateRequest,
     QualityGateResponse,
+    ReleaseRequest,
+    ReleaseResponse,
     ResetResponse,
     SamplePointResponse,
 )
@@ -74,6 +80,33 @@ async def conflict_handler(_: Request, exc: IdempotencyConflict) -> JSONResponse
             )
         },
     )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+    # The default FastAPI handler echoes the rejected input verbatim; echoing
+    # a NaN/Inf float raises during JSON serialization and turns a client
+    # parameter error into a 500. Encode exactly like the default handler,
+    # then replace non-finite floats with string placeholders so malformed
+    # floats are reported as 422 like any other parameter error.
+    detail = jsonable_encoder(exc.errors())
+    return JSONResponse(
+        status_code=422, content={"detail": _sanitize_errors(detail)}
+    )
+
+
+def _sanitize_errors(value: object) -> object:
+    if isinstance(value, float):
+        if value == value and value not in (float("inf"), float("-inf")):
+            return value
+        if value != value:
+            return "<NaN>"
+        return "<Infinity>" if value > 0 else "<-Infinity>"
+    if isinstance(value, dict):
+        return {key: _sanitize_errors(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_errors(item) for item in value]
+    return value
 
 
 @app.get("/health", response_model=HealthResponse, tags=["ops"])
@@ -284,6 +317,53 @@ def quality_gate(batch_id: str, gate: QualityGateRequest) -> QualityGateResponse
             detail=f"sensor {gate.sensor_id!r} not found in batch {batch_id!r}",
         )
     return QualityGateResponse(**doc)
+
+
+@app.post(
+    "/api/v1/batches/{batch_id}/release",
+    response_model=ReleaseResponse,
+    tags=["calibration"],
+    summary="Evaluate device release over required sensors and a time window",
+    responses={404: {"description": "Unknown batch or sensor"}},
+)
+def device_release(batch_id: str, query: ReleaseRequest) -> ReleaseResponse:
+    batch = store.get_batch(batch_id)
+    if batch is None or not batch.events:
+        raise HTTPException(status_code=404, detail=f"batch {batch_id!r} not found")
+    requirements = [
+        ReleaseRequirement(
+            sensor_id=s.sensor_id,
+            min_value=s.min_value,
+            max_value=s.max_value,
+            expected_unit=s.expected_unit,
+        )
+        for s in query.sensors
+    ]
+    # Read-only evaluation against one consistent batch snapshot: both the
+    # sensor-existence check and the sweep run under a single lock.
+    with store.lock:
+        doc = evaluate_device_release(
+            batch_id,
+            query.window_start_ns,
+            query.window_end_ns,
+            requirements,
+            query.min_duration_ns,
+            batch,
+        )
+        known_sensors = {event.sensor_id for event in batch.events.values()}
+    if doc is None:
+        missing = sorted(
+            {req.sensor_id for req in requirements if req.sensor_id not in known_sensors}
+        )
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"sensor(s) {missing} not found in batch {batch_id!r}"
+                if len(missing) > 1
+                else f"sensor {missing[0]!r} not found in batch {batch_id!r}"
+            ),
+        )
+    return ReleaseResponse(**doc)
 
 
 @app.post(

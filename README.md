@@ -6,8 +6,10 @@
 当修订引用了尚未上传的父版本时，返回**可补传的缺口清单（gaps）**；
 重复提交通过幂等键保证**幂等**；在真正提交前还可以**无副作用地预览**一次修订
 会给所属批次带来的影响（preview）；还可对**两个批次的同一传感器**做
-**差异对比审计（compare）**，并对单个传感器的折叠时间线做
-**质量门禁评估（quality gate）**。全部状态保存在**进程内存**中，可随时重置。
+**差异对比审计（compare）**，对单个传感器的折叠时间线做
+**质量门禁评估（quality gate）**，以及在指定半开时段内判断
+**全部必需传感器何时同时满足标定条件的设备放行评估（release）**。
+全部状态保存在**进程内存**中，可随时重置。
 
 ---
 
@@ -117,6 +119,24 @@ pytest -q
   为 `ignore` 时缺口仅记录、不影响判定；为 `fail` 时存在任何缺口即判
   `fail`。响应中的 `timeline_hash` 是对扫描输入（折叠片段 + blocked 跨度）
   的 SHA-256：扫描输入不变则哈希不变，与门禁参数无关。
+- **设备放行**（见 4.7）在同一次批次快照内对**多个必需传感器**做只读扫描：
+  在半开查询窗口 `[window_start_ns, window_end_ns)` 内逐基本区间判定，
+  **所有**传感器同时为 `calibrated`、单位与各自 `expected_unit` 完全一致、
+  值落在各自闭区间 `[min_value, max_value]` 内时该区间才合格。判定沿用
+  同一套因果折叠口径：被 **blocked** 修订覆盖优先判不合格（即使下方已有
+  grounded 标定值），原因给出去重排序的 `missing_ancestors`，可直接照单
+  补传；`withdrawn` 墓碑判 `withdrawn`、已落地片段之外判 `uncovered`、
+  单位不一致判 `unit_mismatch`、值越界判 `out_of_bounds`（闭区间边界算
+  合格）；成环（invalid）修订不参与。相邻合格区间无条件合并；相邻不合格
+  区间仅在每传感器原因集合（sensor + reason）完全相同时合并，
+  `out_of_bounds` 汇总区间极值、`unit_mismatch` 汇总出现过的单位、
+  `blocked` 汇总缺失祖先。**仅时长达到 `min_duration_ns` 的完整连续合格
+  段才出现在 `released_intervals`**；较短的合格段进入
+  `unreleased_intervals` 并标 `qualified=true`、`too_short=true`；不合格
+  段同样进入 `unreleased_intervals` 并按传感器列出原因。两个区间列表合并
+  后按时间排序，恰好覆盖整个查询窗口（半开、按窗口裁剪）。响应中的
+  `input_hash` 是对各必需传感器扫描输入（折叠片段 + blocked 跨度）的
+  SHA-256：快照输入不变则哈希不变，与窗口和放行参数无关。
 
 ---
 
@@ -430,6 +450,106 @@ $ curl -s -X POST localhost:8080/api/v1/batches/B42/quality-gate \
 }
 ```
 
+### `POST /api/v1/batches/{batch_id}/release` — 设备放行评估（多传感器同时合格）
+
+对批次内**一组必需传感器**在指定半开时段 `[window_start_ns, window_end_ns)`
+内做只读扫描，找出所有传感器**同时**满足各自标定条件的连续区间
+（规则见第 3 节）。全部计算在同一次加锁内的同一批次快照上完成，不写入
+任何状态。
+
+请求体：
+
+```json
+{
+  "window_start_ns": 0,
+  "window_end_ns": 300,
+  "min_duration_ns": 100,
+  "sensors": [
+    {"sensor_id": "S1", "min_value": 0.0, "max_value": 4.0, "expected_unit": "C"},
+    {"sensor_id": "S2", "min_value": 1.0, "max_value": 2.0, "expected_unit": "bar"}
+  ]
+}
+```
+
+参数说明：
+
+- `window_start_ns` / `window_end_ns`：半开纳秒查询窗口，非负整数且
+  `window_end_ns > window_start_ns`；结果区间一律裁剪到该窗口内；
+- `sensors`：必需传感器条件列表，**非空且 `sensor_id` 不可重复**；每项给出
+  闭区间上下限（有限浮点数，拒绝 NaN/Inf，且 `min_value <= max_value`）与
+  期望单位（非空字符串，折叠值单位须与之**完全相等**）；
+- `min_duration_ns`：最短连续合格时长（整数，≥ 1）；连续合格段达到该门槛
+  才可放行，未达门槛的合格段标为时长不足。
+
+响应字段：
+
+- `status`：`released`（存在至少一个达到时长门槛的连续合格段）/
+  `not_released`；
+- `released_intervals`：达到门槛的放行区间，按时间排序、相邻已合并，每项含
+  `start_ns`/`end_ns`/`duration_ns`（均按半开边界计算）；
+- `unreleased_intervals`：窗口内其余区间，同样按时间排序、相邻同因合并，
+  与 `released_intervals` 合并后恰好连续覆盖整个查询窗口：
+  - 不合格段：`qualified=false`、`too_short=false`，`sensors` 按 `sensor_id`
+    排序列出在该段上不合格的传感器（合格的传感器不列出）；
+  - 时长不足的合格段：`qualified=true`、`too_short=true`，`sensors` 为空。
+- 每个传感器原因对象 `sensors[]` 的 `reason`：
+  - `blocked`：该时刻被未落地修订覆盖（补传缺失祖先可能改变折叠赢家），
+    即使下方已有 grounded 标定值也判不合格；`missing_ancestors`
+    给出去重排序、可直接照单补传的末端缺失祖先；
+  - `uncovered`：无任何已落地片段覆盖；
+  - `withdrawn`：折叠赢家是撤回墓碑（`value`/`unit` 为 `null`）；
+  - `unit_mismatch`：折叠单位不是 `expected_unit`；`unit` 为该段首段折叠
+    单位，`observed_units` 为合并段内出现过的去重单位（排序）；
+  - `out_of_bounds`：折叠值超出闭区间；`value`/`unit` 为该段首段折叠值，
+    `observed_min_value`/`observed_max_value` 为合并段内观测极值；
+  - 每种原因都回带该传感器的 `min_value`/`max_value`/`expected_unit`；
+  - 成环（invalid）修订不参与扫描，其覆盖点按其余折叠/未覆盖结果判定。
+- `input_hash`：对所有必需传感器扫描输入（折叠片段 + blocked 跨度）的
+  SHA-256，快照输入不变则哈希不变，与窗口、上下限和时长参数无关。
+
+批次或任一请求传感器不存在返回 `404`；查询窗口无效（空或倒置）、传感器
+列表为空或重复、上下限非有限或倒置、时长非正、缺失必填字段或多余字段均
+返回 `422`。
+
+示例（B42 中 S1 与 S2 在 [0,300) 均合格，但 [120,180) 上 S1 有一个等待
+缺失祖先 `v9` 的 blocked 修订；门槛 100ns）：
+
+```bash
+$ curl -s -X POST localhost:8080/api/v1/batches/B42/release \
+    -H 'Content-Type: application/json' \
+    -d '{"window_start_ns":0,"window_end_ns":300,"min_duration_ns":100,
+         "sensors":[
+           {"sensor_id":"S1","min_value":0.0,"max_value":4.0,"expected_unit":"C"},
+           {"sensor_id":"S2","min_value":1.0,"max_value":2.0,"expected_unit":"bar"}]}'
+{
+  "batch_id": "B42",
+  "window_start_ns": 0,
+  "window_end_ns": 300,
+  "min_duration_ns": 100,
+  "status": "released",
+  "released_intervals": [
+    {"start_ns": 0, "end_ns": 120, "duration_ns": 120},
+    {"start_ns": 180, "end_ns": 300, "duration_ns": 120}
+  ],
+  "unreleased_intervals": [
+    {"start_ns": 120, "end_ns": 180, "duration_ns": 60,
+     "qualified": false, "too_short": false,
+     "sensors": [
+       {"sensor_id": "S1", "reason": "blocked",
+        "min_value": 0.0, "max_value": 4.0, "expected_unit": "C",
+        "value": null, "unit": null, "observed_units": [],
+        "observed_min_value": null, "observed_max_value": null,
+        "missing_ancestors": ["v9"]}
+     ]}
+  ],
+  "input_hash": "…"
+}
+```
+
+当两段合格区间都短于门槛（例如此处门槛改为 130ns）时，`status` 为
+`not_released`、`released_intervals` 为空，这两段出现在
+`unreleased_intervals` 中并带 `"qualified": true, "too_short": true`。
+
 ### `POST /admin/reset` — 清空全部内存状态
 
 返回被清除的批次数与事件数。
@@ -483,6 +603,18 @@ curl -s -X POST localhost:8080/api/v1/batches/B42/quality-gate \
        "min_duration_ns":100,"missing_policy":"ignore"}'
 #   -> status="fail", violations=[{"start_ns":100,"end_ns":200,
 #      "duration_ns":100,"min_value":3.5,"max_value":3.5}], gaps=[]
+
+# 6) 设备放行：S1 与 S2 在 [0,300) 同时合格且连续达到 100ns 的区间才可放行；
+#    被 blocked 修订覆盖的时段按传感器列出原因（可补传的缺失祖先）
+curl -s -X POST localhost:8080/api/v1/batches/B42/release \
+  -H 'Content-Type: application/json' \
+  -d '{"window_start_ns":0,"window_end_ns":300,"min_duration_ns":100,
+       "sensors":[
+         {"sensor_id":"S1","min_value":0.0,"max_value":4.0,"expected_unit":"C"},
+         {"sensor_id":"S2","min_value":1.0,"max_value":2.0,"expected_unit":"bar"}]}'
+#   -> status="released"，released_intervals 为达门槛的连续同时合格段，
+#      其余区间（blocked/withdrawn/uncovered/unit_mismatch/out_of_bounds
+#      或时长不足的合格段）在 unreleased_intervals 中按传感器给出原因
 curl -s -X POST localhost:8080/admin/reset
 ```
 
@@ -503,12 +635,12 @@ curl -s -X POST localhost:8080/admin/reset
 ```
 .
 ├── app/
-│   ├── main.py       # FastAPI 路由：ingest / preview / result / sample / compare / quality-gate / reset / health
-│   ├── engine.py     # 因果分类、区间切分折叠、预览影响计算、采样点查询、跨批次差异对比、质量门禁扫描、缺口与哈希（纯函数引擎）
+│   ├── main.py       # FastAPI 路由：ingest / preview / result / sample / compare / quality-gate / release / reset / health
+│   ├── engine.py     # 因果分类、区间切分折叠、预览影响计算、采样点查询、跨批次差异对比、质量门禁扫描、设备放行扫描、缺口与哈希（纯函数引擎）
 │   ├── storage.py    # 线程安全的内存存储、幂等判定与无副作用的提交预览判定
 │   ├── models.py     # Pydantic 请求/响应模型与校验
 │   └── config.py     # CAL_ 前缀环境变量配置
-├── tests/            # pytest（API 端到端 + 引擎单测，共 104 个用例）
+├── tests/            # pytest（API 端到端 + 引擎单测，共 130 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

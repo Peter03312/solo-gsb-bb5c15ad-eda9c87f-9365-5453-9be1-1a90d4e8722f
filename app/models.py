@@ -16,6 +16,7 @@ VersionId = Annotated[str, Field(min_length=1, max_length=200)]
 BatchId = Annotated[str, Field(min_length=1, max_length=200)]
 SensorId = Annotated[str, Field(min_length=1, max_length=200)]
 IdemKey = Annotated[str, Field(min_length=1, max_length=200)]
+UnitName = Annotated[str, Field(min_length=1, max_length=40)]
 
 
 class StrictModel(BaseModel):
@@ -253,6 +254,144 @@ class QualityGateResponse(StrictModel):
     # SHA-256 over the evaluated sensor timeline (folded segments plus
     # blocked spans); changes iff the gate input changes.
     timeline_hash: str
+
+
+class ReleaseSensorRequirement(StrictModel):
+    """Per-sensor acceptance condition for a device-release query."""
+
+    sensor_id: SensorId
+    # Inclusive calibrated-value bounds; a folded value v qualifies iff
+    # min_value <= v <= max_value (NaN/inf bounds are rejected).
+    min_value: float = Field(
+        allow_inf_nan=False,
+        description="Inclusive lower bound of the acceptable calibrated value.",
+    )
+    max_value: float = Field(
+        allow_inf_nan=False,
+        description="Inclusive upper bound of the acceptable calibrated value.",
+    )
+    # Unit the folded calibrated value must carry exactly.
+    expected_unit: UnitName
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> "ReleaseSensorRequirement":
+        if self.min_value > self.max_value:
+            raise ValueError("min_value must be less than or equal to max_value")
+        return self
+
+
+class ReleaseRequest(StrictModel):
+    """Parameters of one read-only device-release evaluation of a batch.
+
+    The query window is the half-open nanosecond interval
+    ``[window_start_ns, window_end_ns)``. All listed sensors must qualify
+    simultaneously throughout a span for it to be releasable; a qualifying
+    span reaches release only when its duration reaches
+    ``min_duration_ns``.
+    """
+
+    window_start_ns: int = Field(ge=0)
+    window_end_ns: int = Field(ge=1)
+    # Every required sensor of the batch; must be non-empty and duplicate-free.
+    sensors: list[ReleaseSensorRequirement] = Field(min_length=1)
+    # Minimum contiguous duration (ns, >= 1) a fully qualifying run must
+    # reach to be reported as a released interval.
+    min_duration_ns: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def _check_window_and_sensors(self) -> "ReleaseRequest":
+        if self.window_end_ns <= self.window_start_ns:
+            raise ValueError(
+                "window_end_ns must be strictly greater than window_start_ns"
+            )
+        ids = [s.sensor_id for s in self.sensors]
+        if len(ids) != len(set(ids)):
+            raise ValueError("sensors must not contain duplicate sensor_id entries")
+        return self
+
+
+class ReleaseSensorReason(StrictModel):
+    """Why one sensor fails a non-qualifying release span.
+
+    reason:
+      blocked   - a not-yet-grounded revision covers the span (backfill may
+                  change the folded winner); see missing_ancestors;
+      uncovered - no grounded segment covers the span;
+      withdrawn - the folded winner is a withdrawal tombstone;
+      unit_mismatch - folded unit is not the expected unit;
+      out_of_bounds - folded value lies outside the inclusive bounds.
+    """
+
+    sensor_id: str
+    reason: Literal[
+        "blocked", "uncovered", "withdrawn", "unit_mismatch", "out_of_bounds"
+    ]
+    # Inclusive bounds / expected unit of the queried requirement.
+    min_value: float
+    max_value: float
+    expected_unit: str
+    # Folded effective payload on the span; null unless the sensor is
+    # calibrated there (blocked/withdrawn/uncovered expose no value).
+    value: Optional[float] = None
+    unit: Optional[str] = None
+    # Distinct folded units observed inside the merged span; populated for
+    # unit_mismatch spans (sorted), empty otherwise.
+    observed_units: list[str] = Field(default_factory=list)
+    # Extreme calibrated values observed inside the merged span; populated
+    # for out_of_bounds spans, null otherwise.
+    observed_min_value: Optional[float] = None
+    observed_max_value: Optional[float] = None
+    # Distinct not-yet-uploaded terminal ancestors; populated for blocked
+    # spans (sorted, ready for backfill), empty otherwise.
+    missing_ancestors: list[str] = Field(default_factory=list)
+
+
+class ReleasedInterval(StrictModel):
+    """One merged half-open span where every required sensor qualifies."""
+
+    start_ns: int
+    end_ns: int
+    duration_ns: int
+
+
+class UnreleasedInterval(StrictModel):
+    """One merged half-open span that cannot be released.
+
+    Either at least one sensor fails the span (``qualified=false``,
+    ``sensors`` lists the failing reasons), or every sensor qualifies but
+    the contiguous run is shorter than ``min_duration_ns``
+    (``qualified=true``, ``too_short=true``).
+    """
+
+    start_ns: int
+    end_ns: int
+    duration_ns: int
+    qualified: bool
+    too_short: bool = False
+    sensors: list[ReleaseSensorReason] = Field(default_factory=list)
+
+
+class ReleaseResponse(StrictModel):
+    """Deterministic device-release verdict for one batch over one window."""
+
+    batch_id: str
+    window_start_ns: int
+    window_end_ns: int
+    min_duration_ns: int
+    # "released": at least one contiguous qualifying run reached the minimum
+    # duration; otherwise "not_released".
+    status: Literal["released", "not_released"]
+    # Contiguous, time-sorted, merged qualifying spans that reached the
+    # duration threshold, clipped to the half-open query window.
+    released_intervals: list[ReleasedInterval] = Field(default_factory=list)
+    # Every other span of the query window, in the same ordering: merged
+    # non-qualifying spans (with per-sensor reasons) and qualifying runs
+    # that were too short. Together with released_intervals this is a
+    # contiguous partition of the whole query window.
+    unreleased_intervals: list[UnreleasedInterval] = Field(default_factory=list)
+    # SHA-256 over the evaluation input (required sensors' folded segments
+    # plus blocked spans); changes iff the snapshot input changes.
+    input_hash: str
 
 
 class IngestResponse(StrictModel):

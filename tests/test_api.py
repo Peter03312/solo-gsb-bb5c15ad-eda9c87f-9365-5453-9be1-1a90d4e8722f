@@ -648,6 +648,22 @@ def test_quality_gate_invalid_params_422(client):
     assert _gate(client, tolerance=0.1).status_code == 422
 
 
+def test_quality_gate_non_finite_raw_bounds_422(client):
+    _post(client, _event("v1", "ROOT", 0, 10, value=1.0))
+    # NaN/Inf sent as raw JSON tokens must be parameter errors (422), never 500.
+    for token in ("NaN", "Infinity", "-Infinity"):
+        payload = (
+            '{"sensor_id":"S1","min_value":0.0,"max_value":' + token
+            + ',"min_duration_ns":1,"missing_policy":"ignore"}'
+        )
+        r = client.post(
+            "/api/v1/batches/B1/quality-gate",
+            content=payload,
+            headers={"content-type": "application/json"},
+        )
+        assert r.status_code == 422
+
+
 def test_quality_gate_deterministic_across_arrival_order(client):
     events = [
         _event("r", "ROOT", 0, 100, value=1.0, key="kr"),

@@ -962,3 +962,292 @@ def evaluate_quality_gate(
         "gaps": gaps,
         "timeline_hash": hash_gate_input(segments, blocked_spans),
     }
+
+
+# ---------------------------------------------------------------------------
+# Device release (multi-sensor simultaneous qualification)
+# ---------------------------------------------------------------------------
+
+# Per-sensor non-qualification reasons emitted by the release scan.
+RELEASE_BLOCKED = "blocked"
+RELEASE_UNCOVERED = "uncovered"
+RELEASE_WITHDRAWN = "withdrawn"
+RELEASE_UNIT_MISMATCH = "unit_mismatch"
+RELEASE_OUT_OF_BOUNDS = "out_of_bounds"
+
+
+@dataclass(frozen=True)
+class ReleaseRequirement:
+    sensor_id: str
+    min_value: float
+    max_value: float
+    expected_unit: str
+
+
+def hash_release_input(views: list[dict]) -> str:
+    """Stable SHA-256 over a release query's per-sensor scan input.
+
+    Covers every required sensor's folded grounded segments plus its blocked
+    revision spans, so the hash changes exactly when the evaluation input
+    changes (window, bounds and threshold do not affect it).
+    """
+    payload = json.dumps(
+        [
+            {
+                "sensor_id": view["req"].sensor_id,
+                "segments": [segment_to_dict(s) for s in view["segments"]],
+                "blocked": [
+                    {
+                        "start_ns": e.start_ns,
+                        "end_ns": e.end_ns,
+                        "revision_id": e.revision_id,
+                    }
+                    for e in view["blocked"]
+                ],
+            }
+            for view in sorted(views, key=lambda v: v["req"].sensor_id)
+        ],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def evaluate_device_release(
+    batch_id: str,
+    window_start_ns: int,
+    window_end_ns: int,
+    requirements: list[ReleaseRequirement],
+    min_duration_ns: int,
+    store: BatchStore,
+) -> Optional[dict]:
+    """Find when all required sensors simultaneously qualify for release.
+
+    Deterministic sweep over the half-open query window. On every elementary
+    interval each sensor is classified against its own requirement; blocked
+    coverage takes precedence (backfilling may change the fold winner) and
+    invalid (cycle) revisions never participate, exactly as in the sample
+    endpoint and quality gate. An interval qualifies only when *every*
+    sensor is calibrated, carries the expected unit and lies within its
+    inclusive bounds.
+
+    Adjacent elementary intervals merge into runs: qualifying runs merge
+    unconditionally; non-qualifying runs merge only while the per-sensor
+    reason set is identical (same sensor ids and reasons). Qualifying runs
+    reaching ``min_duration_ns`` are released; shorter ones are reported as
+    too short. The two output lists together form a contiguous, time-sorted
+    partition of the query window.
+
+    Returns ``None`` when any required sensor is unknown in this batch.
+    """
+    by_sensor = group_by_sensor(store)
+    if any(req.sensor_id not in by_sensor for req in requirements):
+        return None
+
+    views: list[dict] = []
+    points: set[int] = {window_start_ns, window_end_ns}
+    for req in requirements:
+        sensor_events = by_sensor[req.sensor_id]
+        states, depths = classify_sensor(sensor_events)
+        segments = build_timeline(
+            [e for e in sensor_events.values() if states[e.revision_id] == GROUNDED],
+            depths,
+        )
+        blocked = sorted(
+            (e for e in sensor_events.values() if states[e.revision_id] == BLOCKED),
+            key=lambda e: (e.start_ns, e.end_ns, e.revision_id),
+        )
+        for seg in segments:
+            points.update((seg.start_ns, seg.end_ns))
+        for event in blocked:
+            points.update((event.start_ns, event.end_ns))
+        views.append(
+            {
+                "req": req,
+                "events": sensor_events,
+                "segments": segments,
+                "blocked": blocked,
+                "seg_index": 0,
+            }
+        )
+
+    sweep = sorted(p for p in points if window_start_ns < p < window_end_ns)
+    boundaries = [window_start_ns, *sweep, window_end_ns]
+
+    released: list[dict] = []
+    unreleased: list[dict] = []
+    # Open qualifying run: [start, end). Open non-qualifying run carries the
+    # aggregated per-sensor reason state keyed by (sensor_id, reason).
+    qrun: Optional[list[int]] = None
+    nrun: Optional[dict] = None
+
+    def close_qualifying_run(end_ns: int) -> None:
+        nonlocal qrun
+        if qrun is None:
+            return
+        duration = end_ns - qrun[0]
+        if duration >= min_duration_ns:
+            released.append(
+                {"start_ns": qrun[0], "end_ns": end_ns, "duration_ns": duration}
+            )
+        else:
+            unreleased.append(
+                {
+                    "start_ns": qrun[0],
+                    "end_ns": end_ns,
+                    "duration_ns": duration,
+                    "qualified": True,
+                    "too_short": True,
+                    "sensors": [],
+                }
+            )
+        qrun = None
+
+    def close_non_qualifying_run(end_ns: int) -> None:
+        nonlocal nrun
+        if nrun is None:
+            return
+        sensors = [
+            {
+                "sensor_id": state["sensor_id"],
+                "reason": state["reason"],
+                "min_value": state["min_value"],
+                "max_value": state["max_value"],
+                "expected_unit": state["expected_unit"],
+                "value": state["value"],
+                "unit": state["unit"],
+                "observed_units": sorted(state["observed_units"]),
+                "observed_min_value": state["observed_min_value"],
+                "observed_max_value": state["observed_max_value"],
+                "missing_ancestors": sorted(state["missing_ancestors"]),
+            }
+            for state in nrun["states"].values()
+        ]
+        sensors.sort(key=lambda s: s["sensor_id"])
+        unreleased.append(
+            {
+                "start_ns": nrun["start_ns"],
+                "end_ns": end_ns,
+                "duration_ns": end_ns - nrun["start_ns"],
+                "qualified": False,
+                "too_short": False,
+                "sensors": sensors,
+            }
+        )
+        nrun = None
+
+    for lo, hi in zip(boundaries, boundaries[1:]):
+        reasons: dict[tuple[str, str], dict] = {}
+        for view in views:
+            req: ReleaseRequirement = view["req"]
+            covering = [
+                e for e in view["blocked"] if e.start_ns <= lo < e.end_ns
+            ]
+            if covering:
+                reasons[(req.sensor_id, RELEASE_BLOCKED)] = {
+                    "sensor_id": req.sensor_id,
+                    "reason": RELEASE_BLOCKED,
+                    "min_value": req.min_value,
+                    "max_value": req.max_value,
+                    "expected_unit": req.expected_unit,
+                    "value": None,
+                    "unit": None,
+                    "observed_units": set(),
+                    "observed_min_value": None,
+                    "observed_max_value": None,
+                    "missing_ancestors": set(
+                        _terminal_missing_ancestors(
+                            [e.revision_id for e in covering], view["events"]
+                        )
+                    ),
+                }
+                continue
+
+            segments = view["segments"]
+            idx = view["seg_index"]
+            while idx < len(segments) and segments[idx].end_ns <= lo:
+                idx += 1
+            view["seg_index"] = idx
+            if idx < len(segments) and segments[idx].start_ns <= lo:
+                seg = segments[idx]
+            else:
+                seg = None
+            if seg is None:
+                reason_kind = RELEASE_UNCOVERED
+                value = unit = None
+            elif seg.state == "withdrawn":
+                reason_kind = RELEASE_WITHDRAWN
+                value = unit = None
+            elif seg.unit != req.expected_unit:
+                reason_kind = RELEASE_UNIT_MISMATCH
+                value, unit = seg.value, seg.unit
+            elif not (req.min_value <= seg.value <= req.max_value):
+                reason_kind = RELEASE_OUT_OF_BOUNDS
+                value, unit = seg.value, seg.unit
+            else:
+                continue  # this sensor qualifies on the elementary interval
+
+            reasons[(req.sensor_id, reason_kind)] = {
+                "sensor_id": req.sensor_id,
+                "reason": reason_kind,
+                "min_value": req.min_value,
+                "max_value": req.max_value,
+                "expected_unit": req.expected_unit,
+                "value": value,
+                "unit": unit,
+                "observed_units": (
+                    {unit} if reason_kind == RELEASE_UNIT_MISMATCH else set()
+                ),
+                "observed_min_value": (
+                    value if reason_kind == RELEASE_OUT_OF_BOUNDS else None
+                ),
+                "observed_max_value": (
+                    value if reason_kind == RELEASE_OUT_OF_BOUNDS else None
+                ),
+                "missing_ancestors": set(),
+            }
+
+        if not reasons:
+            # Every sensor qualifies on [lo, hi): extend/open a qualifying run.
+            close_non_qualifying_run(lo)
+            if qrun is None:
+                qrun = [lo]
+        else:
+            close_qualifying_run(lo)
+            reason_keys = set(reasons)
+            if nrun is not None and nrun["keys"] == reason_keys:
+                for key, state in reasons.items():
+                    acc = nrun["states"][key]
+                    acc["missing_ancestors"].update(state["missing_ancestors"])
+                    if state["reason"] == RELEASE_UNIT_MISMATCH:
+                        acc["observed_units"].update(state["observed_units"])
+                    if state["reason"] == RELEASE_OUT_OF_BOUNDS:
+                        acc["observed_min_value"] = min(
+                            acc["observed_min_value"], state["observed_min_value"]
+                        )
+                        acc["observed_max_value"] = max(
+                            acc["observed_max_value"], state["observed_max_value"]
+                        )
+                    # value/unit: keep those of the first elementary span
+            else:
+                close_non_qualifying_run(lo)
+                nrun = {
+                    "start_ns": lo,
+                    "keys": reason_keys,
+                    "states": reasons,
+                }
+
+    close_qualifying_run(window_end_ns)
+    close_non_qualifying_run(window_end_ns)
+
+    return {
+        "batch_id": batch_id,
+        "window_start_ns": window_start_ns,
+        "window_end_ns": window_end_ns,
+        "min_duration_ns": min_duration_ns,
+        "status": "released" if released else "not_released",
+        "released_intervals": released,
+        "unreleased_intervals": unreleased,
+        "input_hash": hash_release_input(views),
+    }
