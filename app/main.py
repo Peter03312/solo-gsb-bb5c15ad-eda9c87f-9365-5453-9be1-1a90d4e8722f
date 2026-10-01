@@ -1,4 +1,4 @@
-"""FastAPI application: ingest, timeline/sample/compare query and reset endpoints."""
+"""FastAPI application: ingest, timeline/sample/compare/quality-gate/release query and reset endpoints."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from .engine import (
     compare_sensor,
     evaluate_batch,
     evaluate_quality_gate,
+    evaluate_release,
     evaluate_sample,
     find_sensor_events,
     preview_submission,
@@ -27,6 +28,8 @@ from .models import (
     PreviewResponse,
     QualityGateRequest,
     QualityGateResponse,
+    ReleaseRequest,
+    ReleaseResponse,
     ResetResponse,
     SamplePointResponse,
 )
@@ -284,6 +287,41 @@ def quality_gate(batch_id: str, gate: QualityGateRequest) -> QualityGateResponse
             detail=f"sensor {gate.sensor_id!r} not found in batch {batch_id!r}",
         )
     return QualityGateResponse(**doc)
+
+
+@app.post(
+    "/api/v1/batches/{batch_id}/release",
+    response_model=ReleaseResponse,
+    tags=["calibration"],
+    summary="Evaluate device release windows over required sensors",
+    responses={404: {"description": "Unknown batch or sensor"}},
+)
+def release_check(batch_id: str, request: ReleaseRequest) -> ReleaseResponse:
+    batch = store.get_batch(batch_id)
+    if batch is None or not batch.events:
+        raise HTTPException(status_code=404, detail=f"batch {batch_id!r} not found")
+    # One lock acquisition for the whole read-only evaluation: the release
+    # windows are computed against one consistent batch snapshot.
+    with store.lock:
+        doc = evaluate_release(
+            batch_id,
+            request.start_ns,
+            request.end_ns,
+            request.min_duration_ns,
+            request.sensors,
+            batch,
+        )
+        if doc is None:
+            missing = next(
+                s.sensor_id
+                for s in request.sensors
+                if find_sensor_events(batch, s.sensor_id) is None
+            )
+            raise HTTPException(
+                status_code=404,
+                detail=f"sensor {missing!r} not found in batch {batch_id!r}",
+            )
+    return ReleaseResponse(**doc)
 
 
 @app.post(

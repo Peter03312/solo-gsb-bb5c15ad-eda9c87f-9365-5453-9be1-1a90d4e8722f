@@ -1,8 +1,9 @@
 """Deterministic effective-calibration-timeline engine.
 
 The engine is pure: given a :class:`~app.storage.BatchStore` snapshot it
-produces per-sensor timelines, backfillable gaps, content hashes and
-cross-batch diffs, without keeping state of its own.
+produces per-sensor timelines, backfillable gaps, content hashes,
+cross-batch diffs, quality-gate scans and device-release windows, without
+keeping state of its own.
 """
 
 from __future__ import annotations
@@ -961,4 +962,257 @@ def evaluate_quality_gate(
         "violations": violations,
         "gaps": gaps,
         "timeline_hash": hash_gate_input(segments, blocked_spans),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Device release window
+# ---------------------------------------------------------------------------
+
+# Per-sensor disqualifying states reported inside withheld spans.
+ISSUE_BLOCKED = "blocked"
+ISSUE_UNCOVERED = "uncovered"
+ISSUE_WITHDRAWN = "withdrawn"
+ISSUE_UNIT_MISMATCH = "unit_mismatch"
+ISSUE_OUT_OF_BOUNDS = "out_of_bounds"
+
+# Withheld-span reasons: failing sensors vs. a too-short qualified run.
+REASON_UNQUALIFIED = "unqualified"
+REASON_DURATION_SHORTAGE = "duration_shortage"
+
+
+def hash_release_input(sensor_inputs: list[dict]) -> str:
+    """Stable SHA-256 over a release scan's per-sensor inputs.
+
+    Covers each required sensor's folded grounded segments plus its blocked
+    revision spans, so the hash changes exactly when the release evaluation
+    input changes (independent of the release parameters).
+    """
+    payload = json.dumps(
+        sensor_inputs, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _sensor_issue(
+    req,
+    lo: int,
+    segments: list[Segment],
+    cursor: int,
+    blocked: list[StoredEvent],
+    sensor_events: dict[str, StoredEvent],
+) -> tuple[Optional[dict], int]:
+    """Classify one sensor on one elementary span ``[lo, hi)``.
+
+    Returns ``(issue, cursor)`` where ``issue`` is ``None`` when the sensor
+    satisfies its calibration condition on the span. Blocking takes
+    precedence over grounded coverage: a not-yet-grounded revision covering
+    the span means backfilling could still change the fold winner, so the
+    span is reported as pending backfill even where a calibrated value
+    already exists. Cycle (invalid) revisions never participate.
+    """
+    covering = [e for e in blocked if e.start_ns <= lo < e.end_ns]
+    if covering:
+        return (
+            {
+                "sensor_id": req.sensor_id,
+                "state": ISSUE_BLOCKED,
+                "value": None,
+                "unit": None,
+                "missing_ancestors": _terminal_missing_ancestors(
+                    [e.revision_id for e in covering], sensor_events
+                ),
+            },
+            cursor,
+        )
+    while cursor < len(segments) and segments[cursor].end_ns <= lo:
+        cursor += 1
+    seg = (
+        segments[cursor]
+        if cursor < len(segments) and segments[cursor].start_ns <= lo
+        else None
+    )
+    if seg is None:
+        state, value, unit = ISSUE_UNCOVERED, None, None
+    elif seg.state == "withdrawn":
+        state, value, unit = ISSUE_WITHDRAWN, None, None
+    elif seg.unit != req.unit:
+        state, value, unit = ISSUE_UNIT_MISMATCH, float(seg.value), seg.unit
+    elif not (req.min_value <= seg.value <= req.max_value):
+        state, value, unit = ISSUE_OUT_OF_BOUNDS, float(seg.value), seg.unit
+    else:
+        return None, cursor
+    return (
+        {
+            "sensor_id": req.sensor_id,
+            "state": state,
+            "value": value,
+            "unit": unit,
+            "missing_ancestors": [],
+        },
+        cursor,
+    )
+
+
+def evaluate_release(
+    batch_id: str,
+    start_ns: int,
+    end_ns: int,
+    min_duration_ns: int,
+    requirements: list,
+    store: BatchStore,
+) -> Optional[dict]:
+    """Scan when every required sensor simultaneously qualifies for release.
+
+    Deterministic sweep over the half-open query window
+    ``[start_ns, end_ns)`` on one consistent batch snapshot. Each required
+    sensor is folded with the exact rules of the batch result; every
+    elementary span of the window is classified per sensor (see
+    :func:`_sensor_issue`). Adjacent fully-qualified spans merge into
+    continuous runs regardless of value/provenance boundaries: a run
+    reaching ``min_duration_ns`` is releasable, a shorter one is withheld
+    with reason ``duration_shortage``. Spans where any sensor fails merge
+    only while the per-sensor issue vector stays identical, and are
+    withheld with reason ``unqualified`` listing the failing sensors.
+
+    Returns ``None`` when any required sensor is unknown in this batch.
+    """
+    by_sensor = group_by_sensor(store)
+    prepared: list[dict] = []
+    for req in requirements:
+        sensor_events = by_sensor.get(req.sensor_id)
+        if sensor_events is None:
+            return None
+        states, depths = classify_sensor(sensor_events)
+        segments = build_timeline(
+            [e for e in sensor_events.values() if states[e.revision_id] == GROUNDED],
+            depths,
+        )
+        blocked = sorted(
+            (e for e in sensor_events.values() if states[e.revision_id] == BLOCKED),
+            key=lambda e: (e.start_ns, e.end_ns, e.revision_id),
+        )
+        prepared.append(
+            {
+                "req": req,
+                "events": sensor_events,
+                "segments": segments,
+                "blocked": blocked,
+            }
+        )
+
+    points = {start_ns, end_ns}
+    for entry in prepared:
+        for seg in entry["segments"]:
+            points.update(
+                p for p in (seg.start_ns, seg.end_ns) if start_ns < p < end_ns
+            )
+        for event in entry["blocked"]:
+            points.update(
+                p for p in (event.start_ns, event.end_ns) if start_ns < p < end_ns
+            )
+    ordered = sorted(points)
+
+    released: list[dict] = []
+    withheld: list[dict] = []
+    ok_run: Optional[list] = None  # [start_ns, end_ns] of an open qualified run
+    bad_run: Optional[dict] = None  # open unqualified run with its issue vector
+
+    def close_ok_run() -> None:
+        nonlocal ok_run
+        if ok_run is not None:
+            duration = ok_run[1] - ok_run[0]
+            entry = {
+                "start_ns": ok_run[0],
+                "end_ns": ok_run[1],
+                "duration_ns": duration,
+            }
+            if duration >= min_duration_ns:
+                released.append(entry)
+            else:
+                withheld.append(
+                    {**entry, "reason": REASON_DURATION_SHORTAGE, "sensors": []}
+                )
+            ok_run = None
+
+    def close_bad_run() -> None:
+        nonlocal bad_run
+        if bad_run is not None:
+            withheld.append(
+                {
+                    "start_ns": bad_run["start_ns"],
+                    "end_ns": bad_run["end_ns"],
+                    "duration_ns": bad_run["end_ns"] - bad_run["start_ns"],
+                    "reason": REASON_UNQUALIFIED,
+                    "sensors": bad_run["issues"],
+                }
+            )
+            bad_run = None
+
+    cursors = [0] * len(prepared)  # per-sensor segment pointers (sorted scans)
+    for lo, hi in zip(ordered, ordered[1:]):
+        issues: list[dict] = []
+        for idx, entry in enumerate(prepared):
+            issue, cursors[idx] = _sensor_issue(
+                entry["req"],
+                lo,
+                entry["segments"],
+                cursors[idx],
+                entry["blocked"],
+                entry["events"],
+            )
+            if issue is not None:
+                issues.append(issue)
+        issues.sort(key=lambda i: i["sensor_id"])
+
+        if not issues:
+            close_bad_run()
+            if ok_run is not None:
+                ok_run[1] = hi
+            else:
+                ok_run = [lo, hi]
+        else:
+            close_ok_run()
+            key = json.dumps(issues, sort_keys=True)
+            if bad_run is not None and bad_run["key"] == key:
+                bad_run["end_ns"] = hi
+            else:
+                close_bad_run()
+                bad_run = {
+                    "start_ns": lo,
+                    "end_ns": hi,
+                    "issues": issues,
+                    "key": key,
+                }
+
+    close_ok_run()
+    close_bad_run()
+
+    scan_input = sorted(
+        (
+            {
+                "sensor_id": entry["req"].sensor_id,
+                "segments": [segment_to_dict(s) for s in entry["segments"]],
+                "blocked": [
+                    {
+                        "start_ns": e.start_ns,
+                        "end_ns": e.end_ns,
+                        "revision_id": e.revision_id,
+                    }
+                    for e in entry["blocked"]
+                ],
+            }
+            for entry in prepared
+        ),
+        key=lambda d: d["sensor_id"],
+    )
+    return {
+        "batch_id": batch_id,
+        "window_start_ns": start_ns,
+        "window_end_ns": end_ns,
+        "min_duration_ns": min_duration_ns,
+        "status": "released" if released else "withheld",
+        "released_intervals": released,
+        "withheld_intervals": withheld,
+        "timeline_hash": hash_release_input(scan_input),
     }

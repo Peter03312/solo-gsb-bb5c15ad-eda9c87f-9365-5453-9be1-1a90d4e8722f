@@ -6,8 +6,10 @@
 当修订引用了尚未上传的父版本时，返回**可补传的缺口清单（gaps）**；
 重复提交通过幂等键保证**幂等**；在真正提交前还可以**无副作用地预览**一次修订
 会给所属批次带来的影响（preview）；还可对**两个批次的同一传感器**做
-**差异对比审计（compare）**，并对单个传感器的折叠时间线做
-**质量门禁评估（quality gate）**。全部状态保存在**进程内存**中，可随时重置。
+**差异对比审计（compare）**，对单个传感器的折叠时间线做
+**质量门禁评估（quality gate）**，并对一批**必需传感器**做
+**设备放行评估（release）**：判断它们在指定时段内何时同时满足各自的
+标定条件。全部状态保存在**进程内存**中，可随时重置。
 
 ---
 
@@ -117,6 +119,20 @@ pytest -q
   为 `ignore` 时缺口仅记录、不影响判定；为 `fail` 时存在任何缺口即判
   `fail`。响应中的 `timeline_hash` 是对扫描输入（折叠片段 + blocked 跨度）
   的 SHA-256：扫描输入不变则哈希不变，与门禁参数无关。
+- **设备放行**（见 4.7）对一批**必需传感器**在同一查询窗口内做确定性扫描：
+  沿用同一套因果折叠规则，逐基本区间判定每个传感器是否满足标定条件——
+  缺父修订覆盖（blocked）时即使已有标定值也判**待补传**；撤回
+  （`withdrawn`）、未覆盖（`uncovered`）、单位不符（`unit_mismatch`）、
+  数值越界（`out_of_bounds`，闭区间 `[min_value, max_value]` 之外）均
+  不合格；成环（invalid）修订不参与。所有传感器同时合格的基本区间按
+  纳秒邻接合并为**连续合格段**（与取值/来源边界无关）：仅达到
+  `min_duration_ns` 的完整连续合格段进入 `released_intervals`；较短的
+  合格段以 `duration_shortage` 标明时长不足；其余区间以 `unqualified`
+  标明并**按传感器列出**不合格原因（blocked 区间附可补传的
+  `missing_ancestors`）。放行段与其余段共同构成查询窗口
+  `[start_ns, end_ns)` 的连续分区，各自按时间排序；整个评估在**同一批次
+  快照**内完成，是只读查询。响应中的 `timeline_hash` 是对扫描输入
+  （各传感器折叠片段 + blocked 跨度）的 SHA-256，与放行参数无关。
 
 ---
 
@@ -430,6 +446,91 @@ $ curl -s -X POST localhost:8080/api/v1/batches/B42/quality-gate \
 }
 ```
 
+### `POST /api/v1/batches/{batch_id}/release` — 设备放行评估
+
+对指定批次中**一批必需传感器**做只读放行扫描：在查询窗口
+`[start_ns, end_ns)` 内找出所有传感器**同时**满足各自标定条件、且连续
+合格时长达到 `min_duration_ns` 的时段（规则见第 3 节）。
+
+请求体：
+
+```json
+{
+  "start_ns": 0,
+  "end_ns": 300,
+  "min_duration_ns": 80,
+  "sensors": [
+    {"sensor_id": "S1", "min_value": 0.0, "max_value": 3.0, "unit": "C"},
+    {"sensor_id": "S2", "min_value": 1.0, "max_value": 2.0, "unit": "bar"}
+  ]
+}
+```
+
+参数说明：
+
+- `start_ns` / `end_ns`：半开查询窗口 `[start_ns, end_ns)`（纳秒整数），
+  必须满足 `0 <= start_ns < end_ns`；
+- `min_duration_ns`：最短连续合格时长（整数，≥ 1）。完整连续合格段达到
+  该时长才可放行，较短的合格段以 `duration_shortage` 标明；
+- `sensors`：必需传感器列表（至少 1 个，不允许重复 `sensor_id`）。每项的
+  `min_value` / `max_value` 为数值**闭区间**上下限（有限浮点数，拒绝
+  NaN/Inf，且 `min_value <= max_value`），`unit` 为期望单位。
+
+响应字段：
+
+- `status`：`released`（存在至少一个放行区间）/ `withheld`（无放行区间）；
+- `released_intervals`：按时间排序、合并相邻段后的放行区间，含
+  `start_ns`/`end_ns`/`duration_ns`；
+- `withheld_intervals`：窗口内其余区间（与放行区间共同构成窗口的连续
+  分区），每段带 `reason`：
+  - `unqualified`：至少一个传感器不合格，`sensors` 按传感器列出原因
+    （`blocked` / `uncovered` / `withdrawn` / `unit_mismatch` /
+    `out_of_bounds`；blocked 附 `missing_ancestors`，单位不符与越界附
+    实际 `value`/`unit`）；相邻段仅在原因向量完全相同时合并；
+  - `duration_shortage`：全部传感器合格但连续时长不足 `min_duration_ns`，
+    `sensors` 为空；
+- `timeline_hash`：扫描输入（各传感器折叠片段 + blocked 跨度）的
+  SHA-256，可用于审计与一致性比对。
+
+批次不存在或任一必需传感器不存在返回 `404`；查询区间无效、传感器列表
+为空或重复、上下限非有限或倒置、时长非正、多余字段返回 `422`。
+
+示例（B42：S1 在 [100,200) 取值 3.5 越界，S2 有一段 [240,260) 被缺父
+修订 w2 覆盖待补传；窗口 [0,300)，时长门槛 80ns）：
+
+```bash
+$ curl -s -X POST localhost:8080/api/v1/batches/B42/release \
+    -H 'Content-Type: application/json' \
+    -d '{"start_ns":0,"end_ns":300,"min_duration_ns":80,
+         "sensors":[{"sensor_id":"S1","min_value":0.0,"max_value":3.0,"unit":"C"},
+                    {"sensor_id":"S2","min_value":1.0,"max_value":2.0,"unit":"bar"}]}'
+{
+  "batch_id": "B42",
+  "window_start_ns": 0,
+  "window_end_ns": 300,
+  "min_duration_ns": 80,
+  "status": "released",
+  "released_intervals": [
+    {"start_ns": 0, "end_ns": 100, "duration_ns": 100}
+  ],
+  "withheld_intervals": [
+    {"start_ns": 100, "end_ns": 200, "duration_ns": 100,
+     "reason": "unqualified",
+     "sensors": [{"sensor_id": "S1", "state": "out_of_bounds",
+                  "value": 3.5, "unit": "C", "missing_ancestors": []}]},
+    {"start_ns": 200, "end_ns": 240, "duration_ns": 40,
+     "reason": "duration_shortage", "sensors": []},
+    {"start_ns": 240, "end_ns": 260, "duration_ns": 20,
+     "reason": "unqualified",
+     "sensors": [{"sensor_id": "S2", "state": "blocked",
+                  "value": null, "unit": null, "missing_ancestors": ["w9"]}]},
+    {"start_ns": 260, "end_ns": 300, "duration_ns": 40,
+     "reason": "duration_shortage", "sensors": []}
+  ],
+  "timeline_hash": "…"
+}
+```
+
 ### `POST /admin/reset` — 清空全部内存状态
 
 返回被清除的批次数与事件数。
@@ -483,6 +584,17 @@ curl -s -X POST localhost:8080/api/v1/batches/B42/quality-gate \
        "min_duration_ns":100,"missing_policy":"ignore"}'
 #   -> status="fail", violations=[{"start_ns":100,"end_ns":200,
 #      "duration_ns":100,"min_value":3.5,"max_value":3.5}], gaps=[]
+
+# 6) 设备放行：S1（[0,3] C）与 S2（[1,2] bar）在窗口 [0,300) 内同时合格
+#    且连续 ≥80ns 的时段才放行；其余区间按传感器给出原因
+curl -s -X POST localhost:8080/api/v1/batches/B42/release \
+  -H 'Content-Type: application/json' \
+  -d '{"start_ns":0,"end_ns":300,"min_duration_ns":80,
+       "sensors":[{"sensor_id":"S1","min_value":0.0,"max_value":3.0,"unit":"C"},
+                  {"sensor_id":"S2","min_value":1.0,"max_value":2.0,"unit":"bar"}]}'
+#   -> status="released",
+#      released_intervals=[{"start_ns":0,"end_ns":100,"duration_ns":100}],
+#      withheld_intervals 标明 [100,200) S1 out_of_bounds 等
 curl -s -X POST localhost:8080/admin/reset
 ```
 
@@ -503,12 +615,12 @@ curl -s -X POST localhost:8080/admin/reset
 ```
 .
 ├── app/
-│   ├── main.py       # FastAPI 路由：ingest / preview / result / sample / compare / quality-gate / reset / health
-│   ├── engine.py     # 因果分类、区间切分折叠、预览影响计算、采样点查询、跨批次差异对比、质量门禁扫描、缺口与哈希（纯函数引擎）
+│   ├── main.py       # FastAPI 路由：ingest / preview / result / sample / compare / quality-gate / release / reset / health
+│   ├── engine.py     # 因果分类、区间切分折叠、预览影响计算、采样点查询、跨批次差异对比、质量门禁扫描、设备放行扫描、缺口与哈希（纯函数引擎）
 │   ├── storage.py    # 线程安全的内存存储、幂等判定与无副作用的提交预览判定
 │   ├── models.py     # Pydantic 请求/响应模型与校验
 │   └── config.py     # CAL_ 前缀环境变量配置
-├── tests/            # pytest（API 端到端 + 引擎单测，共 104 个用例）
+├── tests/            # pytest（API 端到端 + 引擎单测，共 119 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
